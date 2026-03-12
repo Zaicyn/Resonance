@@ -1,4 +1,0 @@
-Compilation Times (milliseconds):
-  Baseline 18:  3997ms
-  Baseline 24:  3910ms
-  Resonance 27: 3918ms
