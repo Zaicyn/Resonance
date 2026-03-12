@@ -1,0 +1,22 @@
+Timing Data (milliseconds)
+==========================
+Compilation:
+  Baseline 18:  4040ms
+  Baseline 24:  4006ms
+  Resonance 27: 3919ms
+
+Execution:
+  Baseline 18:  ms
+  Baseline 24:  ms
+  Resonance 27: ms
+
+Per Operation (estimated 320000 total ops):
+  Baseline 18:  ms (μs)
+  Baseline 24:  ms (μs)
+  Resonance 27: ms (μs)
+
+Raw cycle counts:
+  Baseline 18:  4333 avg cycles
+  Baseline 24:  4322 avg cycles
+  Resonance 27: 3587 avg cycles
+  Peak 54Hz:     cycles

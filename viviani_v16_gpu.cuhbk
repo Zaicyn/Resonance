@@ -1,0 +1,726 @@
+// viviani_v16_gpu.cuh  —  V16 Half-Step Alternating Shell GPU Slab Allocator
+//
+// V16 philosophy: "The flow alternates at the half-step."
+//
+// KEY INNOVATION:
+//   Shell pattern alternates between 0010 and 1000:
+//     Phase 0: Shell 2 active (bit pattern 0010)
+//     Phase 1: Shell 0 active (bit pattern 1000)
+//
+//   Shell 0 acts as operation buffer / memoization layer.
+//   Active allocation bounces between shells 2 and 0.
+//
+// THE PATTERN:
+//   0010 → 1000 → 0010 → 1000 ...
+//   Period-2 alternation with position 0 as the pivot.
+//
+// Expected: Zero contention via half-step phase separation
+//
+// ============================================================================
+// V16 CORRECTIONS (all original correct code preserved exactly):
+//
+//   FIX 1 — halfstep_phase race (SAFETY):
+//     Plain read-modify-write on halfstep_phase replaced with atomicXor(1u).
+//     Multiple warps hitting the flip condition simultaneously would have
+//     corrupted the phase. atomicXor is both atomic and correct for a 1-bit
+//     toggle regardless of the old value — no load needed.
+//
+//   FIX 2 — sbs_per_warp underflow guard (SAFETY):
+//     If pool_depth / total_warps rounds to 0 in exclusive mode, n_positions
+//     would be 0 and the alloc loop would never run, silently falling through
+//     to fallback with no diagnostic. Added guard: if sbs_per_warp < sbs_needed,
+//     log and fall back immediately rather than spinning zero iterations.
+//
+//   FIX 3 — static_assert on SBS_PER_WARP parity (LATENT FRAGILITY):
+//     Shell scatter divides sbs_per_warp by 2. If V16_SLAB_SBS_PER_WARP is
+//     ever changed to an odd value, shell 1 silently gets one fewer SB than
+//     shell 0. Added static_assert to catch this at compile time.
+//
+//   FIX 4 — contention stat split: cold_miss vs true contention (ACCURACY):
+//     contention_count was incremented on every cursor advance, conflating
+//     cold misses (bitmap==0, uninitialized superblock) with genuine contention
+//     (another warp took the slot). Now tracked separately:
+//       shell_state->cold_misses  — bitmap was zero (first touch)
+//       shell_state->contention   — bitmap was nonzero but CAS failed
+//     total_contention accumulates only genuine contention. cold_misses is
+//     a new field added to V16_ShellState.
+// ============================================================================
+
+#ifndef VIVIANI_V16_GPU_CUH
+#define VIVIANI_V16_GPU_CUH
+
+#ifdef __CUDACC__
+
+#include <cuda_runtime.h>
+#include <cooperative_groups.h>
+
+#ifdef _Atomic
+    #undef _Atomic
+#endif
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+#define V16_SLAB_CLASSES           3
+#define V16_SLAB_SUPERBLOCK_BYTES  4096
+#define V16_SLAB_SBS_PER_WARP      18    // Standard SBs per warp (shared mode)
+#define V16_SLAB_POOL_DEPTH        64
+
+// FIX 3: Guard against odd SBS_PER_WARP breaking shell scatter symmetry.
+// Shell scatter divides by 2 — both halves must be equal.
+static_assert(V16_SLAB_SBS_PER_WARP % 2 == 0,
+              "V16_SLAB_SBS_PER_WARP must be even: shell scatter divides it by 2");
+
+// V16 HALF-STEP SHELL STRUCTURE (Base-4 with half-step alternation)
+//
+// Pattern in base-4 digits:
+//   10 = 1, 00 = 0  (Phase A)
+//   00 = 0, 10 = 1  (Phase B)
+//   Repeat: 1,0,0,1,1,0,0,1,...
+//
+// The sequence is period-4: positions cycle through shells 1,0,0,1
+// At the half-step, the ordering flips.
+// Shell 0 acts as operation buffer / memoization layer.
+//
+#define V16_NUM_SHELLS             2      // Base-4 uses shells 0 and 1
+#define V16_SHELL_MASK             0x1
+
+// Half-step phase determines ordering: (1,0) vs (0,1)
+#define V16_PHASE_MASK             0x1
+
+// Capped exclusive mode (from V15 optimization)
+// Optimal CAP varies by architecture:
+//   GPU: CAP=8-16 (tighter ranges, lower latency)
+//   CPU: CAP=24   (wider ranges, better cache utilization)
+#ifndef V16_EXCLUSIVE_CAP
+    #ifdef __CUDACC__
+        #define V16_EXCLUSIVE_CAP  16    // GPU: tighter ranges
+    #else
+        #define V16_EXCLUSIVE_CAP  24    // CPU: wider ranges for cache
+    #endif
+#endif
+#define V16_EXCLUSIVE_THRESHOLD    16    // Max warps for exclusive mode
+
+// Half-step timing
+#define V16_HALFSTEP_INTERVAL      16    // Alternate every N allocations
+#define V16_SHELL_DECAY            0.9f
+#define V16_DECAY_INTERVAL         64
+
+// ============================================================================
+// Atomic wrappers
+// ============================================================================
+
+#define V16_ATOMIC_ADD(ptr, val)      atomicAdd((ptr), (val))
+#define V16_ATOMIC_AND(ptr, val)      atomicAnd((uint32_t*)(ptr), (val))
+#define V16_ATOMIC_OR(ptr, val)       atomicOr((uint32_t*)(ptr), (val))
+#define V16_ATOMIC_CAS(ptr, cmp, val) atomicCAS((uint32_t*)(ptr), (cmp), (val))
+#define V16_ATOMIC_XOR(ptr, val)      atomicXor((uint32_t*)(ptr), (val))  // FIX 1
+#define V16_ATOMIC_ADD_ULL(ptr, val)  atomicAdd((unsigned long long*)(ptr), \
+                                                 (unsigned long long)(val))
+
+// ============================================================================
+// Superblock struct — 4096 bytes
+// ============================================================================
+
+typedef struct {
+    volatile uint32_t bitmap;
+    uint32_t          _pad[15];
+    uint8_t           data[V16_SLAB_SUPERBLOCK_BYTES - 64];
+} V16_SlabSuperblock;
+
+static_assert(sizeof(V16_SlabSuperblock) == V16_SLAB_SUPERBLOCK_BYTES,
+              "V16_SlabSuperblock must be 4096 bytes");
+
+// ============================================================================
+// Size-class helpers
+// ============================================================================
+
+__host__ __device__ static inline int v16_slab_class(size_t size) {
+    if (size <= 64)  return 0;
+    if (size <= 128) return 1;
+    if (size <= 256) return 2;
+    return -1;
+}
+
+__host__ __device__ static inline uint32_t v16_slab_slots(int cls) {
+    if (cls == 0) return 32u;
+    if (cls == 1) return 31u;
+    return               15u;
+}
+
+__host__ __device__ static inline uint32_t v16_slab_init_bitmap(int cls) {
+    if (cls == 0) return 0xFFFFFFFFu;
+    if (cls == 1) return 0x7FFFFFFFu;
+    return               0x00007FFFu;
+}
+
+__host__ __device__ static inline size_t v16_slab_stride(int cls) {
+    return (size_t)64u << (uint32_t)cls;
+}
+
+__host__ __device__ static inline uint32_t v16_slab_sbs_per_warp_alloc(int cls) {
+    uint32_t n = v16_slab_slots(cls);
+    return (32u + n - 1u) / n;
+}
+
+// ============================================================================
+// Shell State with Half-Step Phase
+// ============================================================================
+
+typedef struct {
+    volatile uint32_t shell_count[V16_SLAB_CLASSES][V16_NUM_SHELLS];
+    volatile uint32_t halfstep_phase[V16_SLAB_CLASSES];  // 0 = (1,0,0,1), 1 = (0,1,1,0)
+    volatile uint32_t alloc_count[V16_SLAB_CLASSES];
+    volatile uint32_t contention[V16_SLAB_CLASSES];      // FIX 4: genuine contention only
+    volatile uint64_t total_contention[V16_SLAB_CLASSES];// FIX 4: genuine contention only
+    volatile uint32_t cold_misses[V16_SLAB_CLASSES];     // FIX 4: new — cold/uninit hits
+    volatile uint32_t halfstep_flips[V16_SLAB_CLASSES];  // Count of phase alternations
+    volatile uint32_t shell_decays[V16_SLAB_CLASSES];
+    volatile uint32_t exclusive_mode_count[V16_SLAB_CLASSES];
+    volatile uint32_t op_buffer_hits[V16_SLAB_CLASSES];  // Shell 0 as memoization
+} V16_ShellState;
+
+// ============================================================================
+// Half-Step Shell Selection (Base-4 alternation)
+//
+// The pattern is: 1, 0, 0, 1, 1, 0, 0, 1, ...
+//   - Position 0: shell 1
+//   - Position 1: shell 0 (op buffer)
+//   - Position 2: shell 0 (op buffer)
+//   - Position 3: shell 1
+//   Then flips at half-step:
+//   - Position 4: shell 0
+//   - Position 5: shell 1
+//   - etc.
+//
+// This creates a period-4 sequence with the half-step flip.
+// Shell 0 = operation buffer / memoization
+// Shell 1 = primary allocation target
+// ============================================================================
+
+// Base-4 half-step lookup: given position in sequence, return shell
+// Sequence: 1,0,0,1 (phase 0) or 0,1,1,0 (phase 1)
+__device__ static inline uint32_t v16_halfstep_shell(uint32_t pos, uint32_t phase) {
+    // Position within period-4 cycle
+    uint32_t p = pos & 0x3;
+
+    // Pattern for phase 0: 1,0,0,1 (positions 0,1,2,3)
+    // Pattern for phase 1: 0,1,1,0 (flipped)
+    uint32_t base_pattern = (p == 0 || p == 3) ? 1u : 0u;
+
+    // XOR with phase to flip the pattern at half-step
+    return base_pattern ^ (phase & V16_PHASE_MASK);
+}
+
+__device__ static inline uint32_t v16_is_op_buffer(uint32_t shell) {
+    // Shell 0 is the operation buffer / memoization layer
+    return (shell == 0) ? 1u : 0u;
+}
+
+// ============================================================================
+// Pool state
+// ============================================================================
+
+typedef struct {
+    V16_SlabSuperblock* pool[V16_SLAB_CLASSES];
+    uint8_t*            pool_base[V16_SLAB_CLASSES];
+    uint32_t            pool_depth;
+    uint32_t*           d_warp_cursor;
+    uint64_t*           d_allocs;
+    uint64_t*           d_frees;
+    uint64_t*           d_fallbacks;
+    V16_ShellState*     d_shell_state;
+} V16_SlabPool;
+
+typedef struct {
+    V16_SlabPool pool;
+    bool         initialized;
+} V16_SlabContext;
+
+// ============================================================================
+// Host init / destroy
+// ============================================================================
+
+static inline cudaError_t v16_slab_init(V16_SlabContext* ctx, uint32_t pool_depth) {
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->pool.pool_depth = pool_depth;
+
+    for (int c = 0; c < V16_SLAB_CLASSES; c++) {
+        cudaError_t e = cudaMalloc((void**)&ctx->pool.pool[c],
+                                   (size_t)pool_depth * V16_SLAB_SUPERBLOCK_BYTES);
+        if (e != cudaSuccess) return e;
+        cudaMemset(ctx->pool.pool[c], 0, (size_t)pool_depth * V16_SLAB_SUPERBLOCK_BYTES);
+        ctx->pool.pool_base[c] = (uint8_t*)ctx->pool.pool[c];
+    }
+
+    cudaError_t e;
+    e = cudaMalloc((void**)&ctx->pool.d_warp_cursor, V16_SLAB_CLASSES * sizeof(uint32_t));
+    if (e != cudaSuccess) return e;
+    cudaMemset(ctx->pool.d_warp_cursor, 0, V16_SLAB_CLASSES * sizeof(uint32_t));
+
+    e = cudaMalloc((void**)&ctx->pool.d_allocs,    V16_SLAB_CLASSES * sizeof(uint64_t)); if (e != cudaSuccess) return e;
+    e = cudaMalloc((void**)&ctx->pool.d_frees,     V16_SLAB_CLASSES * sizeof(uint64_t)); if (e != cudaSuccess) return e;
+    e = cudaMalloc((void**)&ctx->pool.d_fallbacks, V16_SLAB_CLASSES * sizeof(uint64_t)); if (e != cudaSuccess) return e;
+
+    cudaMemset(ctx->pool.d_allocs,    0, V16_SLAB_CLASSES * sizeof(uint64_t));
+    cudaMemset(ctx->pool.d_frees,     0, V16_SLAB_CLASSES * sizeof(uint64_t));
+    cudaMemset(ctx->pool.d_fallbacks, 0, V16_SLAB_CLASSES * sizeof(uint64_t));
+
+    e = cudaMalloc((void**)&ctx->pool.d_shell_state, sizeof(V16_ShellState));
+    if (e != cudaSuccess) return e;
+    cudaMemset(ctx->pool.d_shell_state, 0, sizeof(V16_ShellState));
+
+    cudaDeviceSynchronize();
+    ctx->initialized = true;
+    return cudaSuccess;
+}
+
+static inline void v16_slab_destroy(V16_SlabContext* ctx) {
+    if (!ctx->initialized) return;
+    for (int c = 0; c < V16_SLAB_CLASSES; c++) {
+        if (ctx->pool.pool[c]) cudaFree(ctx->pool.pool[c]);
+    }
+    if (ctx->pool.d_warp_cursor) cudaFree(ctx->pool.d_warp_cursor);
+    if (ctx->pool.d_allocs)      cudaFree(ctx->pool.d_allocs);
+    if (ctx->pool.d_frees)       cudaFree(ctx->pool.d_frees);
+    if (ctx->pool.d_fallbacks)   cudaFree(ctx->pool.d_fallbacks);
+    if (ctx->pool.d_shell_state) cudaFree(ctx->pool.d_shell_state);
+    ctx->initialized = false;
+}
+
+static inline void v16_slab_reset(V16_SlabContext* ctx) {
+    if (!ctx->initialized) return;
+    for (int c = 0; c < V16_SLAB_CLASSES; c++) {
+        cudaMemset(ctx->pool.pool[c], 0,
+                   (size_t)ctx->pool.pool_depth * V16_SLAB_SUPERBLOCK_BYTES);
+    }
+    cudaMemset(ctx->pool.d_warp_cursor, 0, V16_SLAB_CLASSES * sizeof(uint32_t));
+    cudaMemset(ctx->pool.d_allocs,      0, V16_SLAB_CLASSES * sizeof(uint64_t));
+    cudaMemset(ctx->pool.d_frees,       0, V16_SLAB_CLASSES * sizeof(uint64_t));
+    cudaMemset(ctx->pool.d_fallbacks,   0, V16_SLAB_CLASSES * sizeof(uint64_t));
+    cudaMemset(ctx->pool.d_shell_state, 0, sizeof(V16_ShellState));
+    cudaDeviceSynchronize();
+}
+
+// ============================================================================
+// Device: Warp-Cooperative Bitmap Scan
+// ============================================================================
+
+__device__ static inline bool v16_cooperative_claim_slot(
+    V16_SlabSuperblock* sb,
+    uint32_t slot,
+    uint32_t warp_mask,
+    uint32_t leader,
+    uint32_t lane)
+{
+    uint32_t bmap = 0;
+    if (lane == leader) {
+        bmap = sb->bitmap;
+    }
+    bmap = __shfl_sync(warp_mask, bmap, leader);
+
+    uint32_t mask = 1u << slot;
+    bool appears_free = (bmap & mask) != 0u;
+
+    if (!appears_free) {
+        return false;
+    }
+
+    uint32_t old_bmap = V16_ATOMIC_AND((uint32_t*)&sb->bitmap, ~mask);
+    return (old_bmap & mask) != 0u;
+}
+
+// ============================================================================
+// V16 CAPPED EXCLUSIVE RANGE CALCULATION
+//
+// Key insight: Cap the exclusive range to prevent slow scans.
+// With 2 warps and 64 pool: instead of 32 SBs each, give CAP SBs each.
+// The ranges are still non-overlapping (offset by warp_id * CAP).
+// ============================================================================
+
+__device__ static inline void v16_calculate_capped_exclusive_range(
+    uint32_t global_wid,
+    uint32_t total_warps,
+    uint32_t pool_depth,
+    uint32_t cap,
+    uint32_t* out_base,
+    uint32_t* out_range_size)
+{
+    // Calculate ideal exclusive range
+    uint32_t ideal_range = pool_depth / total_warps;
+
+    // Cap it to prevent slow scans
+    uint32_t capped_range = (ideal_range > cap) ? cap : ideal_range;
+
+    // Calculate base with stride = capped_range (non-overlapping)
+    // Use modulo to wrap around if needed
+    uint32_t warp_slot = global_wid % total_warps;
+    uint32_t base = (warp_slot * capped_range) % pool_depth;
+
+    *out_base = base;
+    *out_range_size = capped_range;
+}
+
+// ============================================================================
+// Device: Alloc V16 (capped exclusive ranges)
+// ============================================================================
+
+__device__ static inline void* v16_slab_alloc(
+    V16_SlabPool* pool,
+    int           cls,
+    uint32_t*     sb_base,
+    uint32_t*     sb_cursor)
+{
+    if (cls < 0) return nullptr;
+
+    const uint32_t lane        = threadIdx.x & 31u;
+    const uint32_t warp_mask   = __activemask();
+    const uint32_t leader      = __ffs(warp_mask) - 1u;
+    const uint32_t n_slots     = v16_slab_slots(cls);
+    const uint32_t sbs_needed  = v16_slab_sbs_per_warp_alloc(cls);
+
+    // Calculate total warps in grid
+    uint32_t block_id    = blockIdx.x + blockIdx.y * gridDim.x
+                         + blockIdx.z * gridDim.x * gridDim.y;
+    uint32_t wpb         = blockDim.x / 32u;
+    uint32_t local_wid   = threadIdx.x / 32u;
+    uint32_t global_wid  = block_id * wpb + local_wid;
+    uint32_t total_warps = wpb * gridDim.x * gridDim.y * gridDim.z;
+
+    // V16: Use capped exclusive mode when warps are sparse enough.
+    // Exclusive if: total_warps * CAP <= pool_depth (non-overlapping ranges fit)
+    bool use_exclusive = (total_warps <= V16_EXCLUSIVE_THRESHOLD) &&
+                         (total_warps * V16_EXCLUSIVE_CAP <= pool->pool_depth);
+
+    // Determine SBs per warp based on mode
+    uint32_t sbs_per_warp;
+    if (use_exclusive) {
+        uint32_t ideal = (total_warps > 0) ? pool->pool_depth / total_warps : 0u;
+        sbs_per_warp = (ideal > V16_EXCLUSIVE_CAP) ? V16_EXCLUSIVE_CAP : ideal;
+    } else {
+        sbs_per_warp = V16_SLAB_SBS_PER_WARP;
+    }
+
+    // FIX 2: Guard against sbs_per_warp underflow.
+    // If pool_depth / total_warps rounds to 0, or sbs_per_warp < sbs_needed,
+    // the loop below would run zero iterations and silently fall through to
+    // fallback. Catch it here with a diagnostic before falling back.
+    if (sbs_per_warp < sbs_needed) {
+        if (lane == leader && pool->d_shell_state != nullptr) {
+            // Reuse cold_misses as the underflow counter — it's the closest
+            // semantic match (pool undersized for this warp count).
+            atomicAdd((uint32_t*)&pool->d_shell_state->cold_misses[cls], 1u);
+        }
+        V16_ATOMIC_ADD_ULL(&pool->d_fallbacks[cls], 1ULL);
+        return nullptr;
+    }
+
+    // First allocation: claim range
+    if (*sb_base == 0xFFFFFFFFu) {
+        uint32_t base = 0, init_cursor = 0;
+        if (lane == leader) {
+            if (use_exclusive) {
+                // CAPPED EXCLUSIVE MODE: Calculate non-overlapping range
+                uint32_t range_size;
+                v16_calculate_capped_exclusive_range(
+                    global_wid, total_warps, pool->pool_depth,
+                    V16_EXCLUSIVE_CAP, &base, &range_size);
+                init_cursor = 0;
+
+                if (pool->d_shell_state != nullptr) {
+                    atomicAdd((uint32_t*)&pool->d_shell_state->exclusive_mode_count[cls], 1u);
+                }
+            } else {
+                // SHARED MODE: Base-4 half-step pattern
+                // Sequence: 1,0,0,1 (phase 0) or 0,1,1,0 (phase 1)
+                base = V16_ATOMIC_ADD(&pool->d_warp_cursor[cls], sbs_per_warp);
+
+                uint32_t alloc_num = 0;
+                uint32_t phase     = 0;
+                if (pool->d_shell_state != nullptr) {
+                    alloc_num = atomicAdd(
+                        (uint32_t*)&pool->d_shell_state->alloc_count[cls], 1u);
+
+                    // FIX 1: halfstep_phase flip was a plain read-modify-write,
+                    // racing when multiple warps hit the interval simultaneously.
+                    // atomicXor(1u) is atomic and correct for a 1-bit toggle —
+                    // no load of the current value needed, no lost updates.
+                    if ((alloc_num & (V16_HALFSTEP_INTERVAL - 1u)) == 0u) {
+                        V16_ATOMIC_XOR(
+                            (uint32_t*)&pool->d_shell_state->halfstep_phase[cls],
+                            1u);
+                        atomicAdd(
+                            (uint32_t*)&pool->d_shell_state->halfstep_flips[cls],
+                            1u);
+                    }
+
+                    // Read phase AFTER the conditional flip so this warp sees
+                    // the updated value if it was the one to flip it.
+                    phase = pool->d_shell_state->halfstep_phase[cls];
+                }
+
+                // Base-4 half-step shell selection
+                uint32_t shell = v16_halfstep_shell(global_wid, phase);
+
+                // Prime multiplier scatter within the shell's range
+                uint32_t grid_warps    = (total_warps > 0u) ? total_warps : 1u;
+                uint32_t scattered_wid = (global_wid * 37u) % grid_warps;
+
+                // Map to shell's SB range — each shell owns exactly half.
+                // (static_assert at top guarantees sbs_per_warp is even.)
+                uint32_t half_sbs   = sbs_per_warp / 2u;
+                uint32_t shell_base = shell * half_sbs;
+                uint32_t scatter    = shell_base + (scattered_wid % half_sbs);
+
+                uint32_t n_pos  = sbs_per_warp / sbs_needed;
+                init_cursor     = (scatter % n_pos) * sbs_needed;
+
+                if (pool->d_shell_state != nullptr) {
+                    atomicAdd(
+                        (uint32_t*)&pool->d_shell_state->shell_count[cls][shell],
+                        1u);
+                    if (shell == 0) {
+                        atomicAdd(
+                            (uint32_t*)&pool->d_shell_state->op_buffer_hits[cls],
+                            1u);
+                    }
+                }
+            }
+        }
+        *sb_base   = __shfl_sync(warp_mask, base,        leader);
+        *sb_cursor = __shfl_sync(warp_mask, init_cursor, leader);
+    }
+
+    const uint32_t n_positions      = sbs_per_warp / sbs_needed;
+    uint32_t       contention_count = 0;  // FIX 4: genuine contention only
+    uint32_t       cold_miss_count  = 0;  // FIX 4: cold/uninit misses
+
+    for (uint32_t attempt = 0; attempt < n_positions; attempt++) {
+        uint32_t sb_sub = lane / n_slots;
+        uint32_t slot   = lane % n_slots;
+
+        uint32_t global_sb;
+        if (use_exclusive) {
+            global_sb = *sb_base + ((*sb_cursor + sb_sub) % sbs_per_warp);
+        } else {
+            global_sb = *sb_base + *sb_cursor + sb_sub;
+        }
+
+        if (global_sb >= pool->pool_depth) {
+            V16_ATOMIC_ADD_ULL(&pool->d_fallbacks[cls], 1ULL);
+            return nullptr;
+        }
+
+        V16_SlabSuperblock* sb = &pool->pool[cls][global_sb];
+
+        // FIX 4: Detect cold miss before the bitmap stamp so we can count it
+        // separately. A cold miss is when the bitmap is zero — the superblock
+        // has never been touched. This is not contention; it's first-touch latency.
+        bool was_cold = false;
+        if (lane == sb_sub * n_slots) {
+            if (sb->bitmap == 0u) {
+                V16_ATOMIC_CAS((uint32_t*)&sb->bitmap, 0u, v16_slab_init_bitmap(cls));
+                was_cold = true;
+            }
+        }
+        // Broadcast cold flag across warp so all lanes agree on the count.
+        // Only the stamping lane knows; use ballot to surface it.
+        uint32_t cold_mask = __ballot_sync(warp_mask, was_cold);
+        if (cold_mask && lane == leader) cold_miss_count++;
+
+        __syncwarp(warp_mask);
+
+        bool succeeded = v16_cooperative_claim_slot(sb, slot, warp_mask, leader, lane);
+
+        uint32_t winners = __ballot_sync(warp_mask, succeeded);
+        if (succeeded) {
+            if (lane == leader) {
+                V16_ATOMIC_ADD_ULL(&pool->d_allocs[cls],
+                                   (unsigned long long)__popc(winners));
+            }
+            return (void*)(sb->data + (size_t)slot * v16_slab_stride(cls));
+        }
+
+        // FIX 4: Only count as contention if the bitmap was NOT cold.
+        // A cold stamp that then loses the CAS is still a cold miss, not
+        // genuine inter-warp contention.
+        if (!cold_mask) contention_count++;
+
+        // Cursor advance (wraps within range in exclusive mode)
+        uint32_t next = 0;
+        if (lane == leader) {
+            *sb_cursor = (*sb_cursor + sbs_needed) % sbs_per_warp;
+            next = *sb_cursor;
+        }
+        *sb_cursor = __shfl_sync(warp_mask, next, leader);
+    }
+
+    // Flush accumulated stats (leader posts one atomic per counter)
+    if (lane == leader && pool->d_shell_state != nullptr) {
+        if (contention_count > 0u) {
+            atomicAdd((uint32_t*)&pool->d_shell_state->contention[cls],
+                      contention_count);
+            V16_ATOMIC_ADD_ULL(
+                (unsigned long long*)&pool->d_shell_state->total_contention[cls],
+                (unsigned long long)contention_count);
+        }
+        if (cold_miss_count > 0u) {
+            atomicAdd((uint32_t*)&pool->d_shell_state->cold_misses[cls],
+                      cold_miss_count);
+        }
+    }
+
+    V16_ATOMIC_ADD_ULL(&pool->d_fallbacks[cls], 1ULL);
+    return nullptr;
+}
+
+// ============================================================================
+// Device: Free V16
+// ============================================================================
+
+__device__ static inline void v16_slab_free(V16_SlabPool* pool, void* ptr, int cls) {
+    if (cls < 0 || !ptr) return;
+
+    ptrdiff_t off = (uint8_t*)ptr - pool->pool_base[cls];
+    if (off < 0) return;
+
+    uint32_t sb_idx = (uint32_t)((size_t)off / V16_SLAB_SUPERBLOCK_BYTES);
+    if (sb_idx >= pool->pool_depth) return;
+
+    V16_SlabSuperblock* sb = &pool->pool[cls][sb_idx];
+    ptrdiff_t doff = (uint8_t*)ptr - sb->data;
+    if (doff < 0) return;
+
+    uint32_t slot = (uint32_t)((size_t)doff / v16_slab_stride(cls));
+    if (slot >= v16_slab_slots(cls)) return;
+
+    V16_ATOMIC_OR((uint32_t*)&sb->bitmap, 1u << slot);
+
+    uint32_t free_mask = __activemask();
+    uint32_t free_lane = threadIdx.x & 31u;
+    uint32_t free_lead = __ffs(free_mask) - 1u;
+    if (free_lane == free_lead) {
+        V16_ATOMIC_ADD_ULL(&pool->d_frees[cls], (unsigned long long)__popc(free_mask));
+    }
+}
+
+// Convenience wrappers
+__device__ static inline void* v16_slab_alloc_sz(
+    V16_SlabPool* pool, size_t size, uint32_t* sb_base, uint32_t* sb_cursor)
+{
+    return v16_slab_alloc(pool, v16_slab_class(size), sb_base, sb_cursor);
+}
+
+__device__ static inline void v16_slab_free_sz(V16_SlabPool* pool, void* ptr, size_t size) {
+    v16_slab_free(pool, ptr, v16_slab_class(size));
+}
+
+// ============================================================================
+// Host: Stats
+// ============================================================================
+
+typedef struct {
+    uint64_t allocs[V16_SLAB_CLASSES];
+    uint64_t frees[V16_SLAB_CLASSES];
+    uint64_t fallbacks[V16_SLAB_CLASSES];
+    uint64_t contention[V16_SLAB_CLASSES];      // genuine inter-warp contention
+    uint32_t cold_misses[V16_SLAB_CLASSES];     // FIX 4: first-touch cold misses
+    uint32_t halfstep_flips[V16_SLAB_CLASSES];
+    uint32_t op_buffer_hits[V16_SLAB_CLASSES];
+    uint32_t shell_decays[V16_SLAB_CLASSES];
+    uint32_t exclusive_mode_count[V16_SLAB_CLASSES];
+    uint32_t shell_counts[V16_SLAB_CLASSES][V16_NUM_SHELLS];
+} V16_SlabStats;
+
+static inline V16_SlabStats v16_slab_stats(const V16_SlabContext* ctx) {
+    V16_SlabStats s = {0};
+    if (!ctx->initialized) return s;
+
+    cudaMemcpy(s.allocs,    ctx->pool.d_allocs,    V16_SLAB_CLASSES * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(s.frees,     ctx->pool.d_frees,     V16_SLAB_CLASSES * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(s.fallbacks, ctx->pool.d_fallbacks, V16_SLAB_CLASSES * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+
+    V16_ShellState ss;
+    cudaMemcpy(&ss, ctx->pool.d_shell_state, sizeof(V16_ShellState), cudaMemcpyDeviceToHost);
+    for (int c = 0; c < V16_SLAB_CLASSES; c++) {
+        s.contention[c]           = ss.total_contention[c];
+        s.cold_misses[c]          = ss.cold_misses[c];
+        s.halfstep_flips[c]       = ss.halfstep_flips[c];
+        s.op_buffer_hits[c]       = ss.op_buffer_hits[c];
+        s.shell_decays[c]         = ss.shell_decays[c];
+        s.exclusive_mode_count[c] = ss.exclusive_mode_count[c];
+        for (int sh = 0; sh < V16_NUM_SHELLS; sh++)
+            s.shell_counts[c][sh] = ss.shell_count[c][sh];
+    }
+
+    return s;
+}
+
+static inline void v16_slab_print_stats(const V16_SlabStats* s) {
+    const char* nm[] = {"64B ", "128B", "256B"};
+    printf("=== Viviani Slab Stats V16 (Base-4 Half-Step: 1,0,0,1 ↔ 0,1,1,0, CAP=%d) ===\n",
+           V16_EXCLUSIVE_CAP);
+    printf("  Class  |   Allocs   |   Frees    | Fallbacks | Contention | ColdMiss  | HalfFlips | OpBufHits\n");
+    printf("  -------|------------|------------|-----------|------------|-----------|-----------|----------\n");
+    for (int c = 0; c < V16_SLAB_CLASSES; c++) {
+        printf("  %s   | %10llu | %10llu | %9llu | %10llu | %9u | %9u | %9u\n", nm[c],
+               (unsigned long long)s->allocs[c],
+               (unsigned long long)s->frees[c],
+               (unsigned long long)s->fallbacks[c],
+               (unsigned long long)s->contention[c],
+               s->cold_misses[c],
+               s->halfstep_flips[c],
+               s->op_buffer_hits[c]);
+    }
+    printf("  Shell distribution (0=OpBuf/Memo, 1=Primary):\n");
+    for (int c = 0; c < V16_SLAB_CLASSES; c++) {
+        printf("    %s: [0]=%u [1]=%u | Exclusive=%u\n", nm[c],
+               s->shell_counts[c][0], s->shell_counts[c][1],
+               s->exclusive_mode_count[c]);
+    }
+}
+
+// ============================================================================
+// Stress Test Kernel
+// ============================================================================
+
+__global__ void v16_stress_kernel(V16_SlabPool* pool, uint32_t iters,
+                                   uint32_t* success_count) {
+    uint32_t sb_base[V16_SLAB_CLASSES];
+    uint32_t sb_cursor[V16_SLAB_CLASSES];
+
+    for (int c = 0; c < V16_SLAB_CLASSES; c++) {
+        sb_base[c]   = 0xFFFFFFFFu;
+        sb_cursor[c] = 0;
+    }
+
+    uint32_t tid           = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t local_success = 0;
+    void*    held[V16_SLAB_CLASSES] = {nullptr};
+
+    for (uint32_t i = 0; i < iters; i++) {
+        int cls = (tid + i) % V16_SLAB_CLASSES;
+
+        if (held[cls]) {
+            v16_slab_free(pool, held[cls], cls);
+            held[cls] = nullptr;
+        }
+
+        void* ptr = v16_slab_alloc(pool, cls, &sb_base[cls], &sb_cursor[cls]);
+        if (ptr) {
+            *((volatile uint8_t*)ptr) = (uint8_t)(tid ^ i);
+            held[cls] = ptr;
+            local_success++;
+        }
+    }
+
+    for (int c = 0; c < V16_SLAB_CLASSES; c++) {
+        if (held[c]) v16_slab_free(pool, held[c], c);
+    }
+
+    atomicAdd(success_count, local_success);
+}
+
+#endif // __CUDACC__
+#endif // VIVIANI_V16_GPU_CUH

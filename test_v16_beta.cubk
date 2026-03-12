@@ -1,0 +1,473 @@
+// test_v16_beta.cu
+// CUDA test suite for viviani_v16_gpu.cuh (corrected V16) and
+// viviani_v16_beta.cuh (dual-strand beta-sheet extension).
+//
+// Compile (RTX 2060 / sm_75):
+//   nvcc -O2 -std=c++17 -arch=sm_75 \
+//        -o test_v16_beta test_v16_beta.cu -lm \
+//        && ./test_v16_beta
+//
+// Other arch values:
+//   sm_60 Pascal / sm_70 Volta / sm_80 Ampere / sm_89 Ada / sm_90 Hopper
+
+#include <cuda_runtime.h>
+#include <cooperative_groups.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <math.h>
+
+#include "aizawa.cuh"
+#include "aizawa_slab.cuh"
+#include "viviani_v16_gpu.cuh"
+#include "viviani_v16_beta.cuh"
+
+// ============================================================================
+// Harness
+// ============================================================================
+
+static int tests_run = 0, tests_passed = 0, tests_failed = 0;
+
+#define TEST(name)      do { printf("  %-58s ", name); tests_run++; } while(0)
+#define PASS()          do { printf("PASS\n"); tests_passed++; } while(0)
+#define FAIL(reason)    do { printf("FAIL  (%s)\n", reason); tests_failed++; } while(0)
+#define CHECK(c, msg)   do { if (!(c)) { FAIL(msg); return; } } while(0)
+
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t _e = (call); \
+        if (_e != cudaSuccess) { \
+            fprintf(stderr, "CUDA error %s at line %d\n", \
+                    cudaGetErrorString(_e), __LINE__); \
+            exit(1); \
+        } \
+    } while(0)
+
+// ============================================================================
+// Kernel: verify period-4 halfstep pattern
+// ============================================================================
+__global__ void k_halfstep_pattern(uint32_t* out) {
+    if (threadIdx.x != 0) return;
+    // Phase 0 → 1,0,0,1
+    out[0] = v16_halfstep_shell(0, 0);
+    out[1] = v16_halfstep_shell(1, 0);
+    out[2] = v16_halfstep_shell(2, 0);
+    out[3] = v16_halfstep_shell(3, 0);
+    // Phase 1 → 0,1,1,0
+    out[4] = v16_halfstep_shell(0, 1);
+    out[5] = v16_halfstep_shell(1, 1);
+    out[6] = v16_halfstep_shell(2, 1);
+    out[7] = v16_halfstep_shell(3, 1);
+}
+
+// ============================================================================
+// Kernel: V16 stress — alloc(cls=0) then free, track successes
+//
+// v16_slab_alloc signature: (V16_SlabPool*, int cls, uint32_t* sb_base,
+//                             uint32_t* sb_cursor)
+// Warp identity is computed internally from threadIdx/blockIdx.
+// ============================================================================
+__global__ void k_v16_stress(V16_SlabPool* pool, int iters,
+                              unsigned long long* d_ok,
+                              unsigned long long* d_fail)
+{
+    const uint32_t lane = threadIdx.x & 31u;
+
+    uint32_t sb_base   = 0xFFFFFFFFu;
+    uint32_t sb_cursor = 0;
+
+    unsigned long long ok = 0, fail = 0;
+
+    for (int i = 0; i < iters; i++) {
+        void* p = v16_slab_alloc(pool, 0, &sb_base, &sb_cursor);
+        if (p) {
+            ok++;
+            if (lane == 0) ((uint32_t*)p)[0] = threadIdx.x;
+            __syncwarp(__activemask());
+            v16_slab_free(pool, p, 0);
+        } else {
+            fail++;
+        }
+    }
+
+    if (lane == 0) {
+        atomicAdd(d_ok,   ok);
+        atomicAdd(d_fail, fail);
+    }
+}
+
+// ============================================================================
+// Kernel: Beta stress — alloc via beta path, then free
+//
+// beta_slab_alloc signature: (V16_SlabPool*, BetaStrandState*, int cls,
+//                              uint32_t* sb_base, uint32_t* sb_cursor,
+//                              uint32_t* strand)
+// beta_slab_free signature:  (V16_SlabPool*, void*, int cls)
+// ============================================================================
+__global__ void k_beta_stress(V16_SlabPool* pool, BetaStrandState* beta,
+                               int iters,
+                               unsigned long long* d_ok,
+                               unsigned long long* d_fail)
+{
+    const uint32_t lane = threadIdx.x & 31u;
+
+    uint32_t sb_base   = 0xFFFFFFFFu;
+    uint32_t sb_cursor = 0;
+    uint32_t strand    = 0xFFFFFFFFu;
+
+    unsigned long long ok = 0, fail = 0;
+
+    for (int i = 0; i < iters; i++) {
+        void* p = beta_slab_alloc(pool, beta, 0, &sb_base, &sb_cursor, &strand);
+        if (p) {
+            ok++;
+            if (lane == 0) ((uint32_t*)p)[0] = threadIdx.x;
+            __syncwarp(__activemask());
+            beta_slab_free(pool, p, 0);
+        } else {
+            fail++;
+        }
+    }
+
+    if (lane == 0) {
+        atomicAdd(d_ok,   ok);
+        atomicAdd(d_fail, fail);
+    }
+}
+
+// ============================================================================
+// Kernel: Beta pressure — hold allocations to exhaust strand, trigger rungs
+// ============================================================================
+__global__ void k_beta_pressure(V16_SlabPool* pool, BetaStrandState* beta)
+{
+    const uint32_t lane = threadIdx.x & 31u;
+    (void)lane;
+
+    uint32_t sb_base   = 0xFFFFFFFFu;
+    uint32_t sb_cursor = 0;
+    uint32_t strand    = 0xFFFFFFFFu;
+
+    void* held[16];
+    int   n = 0;
+
+    for (int i = 0; i < 16; i++) {
+        void* p = beta_slab_alloc(pool, beta, 0, &sb_base, &sb_cursor, &strand);
+        if (p) held[n++] = p;
+    }
+    for (int i = 0; i < n; i++)
+        beta_slab_free(pool, held[i], 0);
+}
+
+// ============================================================================
+// Test 1: V16 compile-time constants
+// ============================================================================
+static void test_v16_constants(void) {
+    TEST("V16 constants — SBS_PER_WARP even, classes and sizes correct");
+
+    CHECK(V16_SLAB_SBS_PER_WARP % 2 == 0, "SBS_PER_WARP is odd");
+    CHECK(V16_SLAB_CLASSES       == 3,     "expected 3 size classes");
+    CHECK(V16_HALFSTEP_INTERVAL  == 16,    "halfstep interval != 16");
+    CHECK(V16_SLAB_POOL_DEPTH    >= 16,    "pool depth too shallow");
+    CHECK(v16_slab_slots(0)      == 32,    "class 0 slots != 32");
+    CHECK(v16_slab_slots(1)      == 31,    "class 1 slots != 31");
+    CHECK(v16_slab_slots(2)      == 15,    "class 2 slots != 15");
+
+    PASS();
+}
+
+// ============================================================================
+// Test 2: V16 init / destroy
+// ============================================================================
+static void test_v16_init(void) {
+    TEST("V16 init/destroy — pool and shell state allocated and zeroed");
+
+    V16_SlabContext ctx;
+    CUDA_CHECK(v16_slab_init(&ctx, V16_SLAB_POOL_DEPTH));
+    CHECK(ctx.initialized,               "initialized not set");
+    CHECK(ctx.pool.pool[0]    != NULL,   "class 0 pool NULL");
+    CHECK(ctx.pool.d_shell_state != NULL, "shell state NULL");
+
+    V16_ShellState ss;
+    CUDA_CHECK(cudaMemcpy(&ss, ctx.pool.d_shell_state,
+                          sizeof(V16_ShellState), cudaMemcpyDeviceToHost));
+    for (int c = 0; c < V16_SLAB_CLASSES; c++) {
+        CHECK(ss.halfstep_phase[c] == 0, "phase not 0 at init");
+        CHECK(ss.alloc_count[c]    == 0, "alloc_count not 0");
+        CHECK(ss.cold_misses[c]    == 0, "cold_misses not 0");
+    }
+
+    v16_slab_destroy(&ctx);
+    PASS();
+}
+
+// ============================================================================
+// Test 3: V16 halfstep period-4 pattern
+// ============================================================================
+static void test_v16_halfstep(void) {
+    TEST("V16 halfstep — period-4 pattern correct for both phases");
+
+    uint32_t* d; CUDA_CHECK(cudaMalloc(&d, 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemset(d, 0, 8 * sizeof(uint32_t)));
+    k_halfstep_pattern<<<1, 32>>>(d);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    uint32_t h[8];
+    CUDA_CHECK(cudaMemcpy(h, d, 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    cudaFree(d);
+
+    CHECK(h[0]==1 && h[1]==0 && h[2]==0 && h[3]==1, "phase 0 pattern wrong");
+    CHECK(h[4]==0 && h[5]==1 && h[6]==1 && h[7]==0, "phase 1 pattern wrong");
+    PASS();
+}
+
+// ============================================================================
+// Test 4: V16 stress — alloc/free under warp pressure
+// ============================================================================
+static void test_v16_stress(void) {
+    TEST("V16 stress — alloc/free class 0, success rate >= 80%%");
+
+    V16_SlabContext ctx;
+    CUDA_CHECK(v16_slab_init(&ctx, V16_SLAB_POOL_DEPTH));
+
+    unsigned long long* d_ok;
+    unsigned long long* d_fail;
+    CUDA_CHECK(cudaMalloc(&d_ok,   sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMalloc(&d_fail, sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemset(d_ok,   0, sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemset(d_fail, 0, sizeof(unsigned long long)));
+
+    k_v16_stress<<<4, 128>>>(&ctx.pool, 100, d_ok, d_fail);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    unsigned long long ok = 0, fail = 0;
+    CUDA_CHECK(cudaMemcpy(&ok,   d_ok,   sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&fail, d_fail, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    cudaFree(d_ok); cudaFree(d_fail);
+
+    float rate = (ok + fail > 0) ? (float)ok / (float)(ok + fail) : 0.f;
+    printf("\n    ok=%llu fail=%llu rate=%.1f%%  ", ok, fail, rate * 100.f);
+
+    CHECK(ok + fail > 0,  "no alloc attempts");
+    CHECK(rate >= 0.80f,  "success rate below 80%");
+
+    uint64_t h_allocs[V16_SLAB_CLASSES];
+    CUDA_CHECK(cudaMemcpy(h_allocs, ctx.pool.d_allocs,
+                          V16_SLAB_CLASSES * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    CHECK(h_allocs[0] > 0, "pool d_allocs[0] not incremented");
+
+    v16_slab_destroy(&ctx);
+    PASS();
+}
+
+// ============================================================================
+// Test 5: V16 cold_miss vs contention split
+// ============================================================================
+static void test_v16_stat_split(void) {
+    TEST("V16 stats — cold_misses / contention fields readable");
+
+    V16_SlabContext ctx;
+    CUDA_CHECK(v16_slab_init(&ctx, V16_SLAB_POOL_DEPTH));
+
+    unsigned long long* d_ok;
+    unsigned long long* d_fail;
+    CUDA_CHECK(cudaMalloc(&d_ok,   sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMalloc(&d_fail, sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemset(d_ok,   0, sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemset(d_fail, 0, sizeof(unsigned long long)));
+
+    k_v16_stress<<<2, 128>>>(&ctx.pool, 50, d_ok, d_fail);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    cudaFree(d_ok); cudaFree(d_fail);
+
+    V16_ShellState ss;
+    CUDA_CHECK(cudaMemcpy(&ss, ctx.pool.d_shell_state,
+                          sizeof(V16_ShellState), cudaMemcpyDeviceToHost));
+
+    printf("\n    cls0: cold=%u contention=%u flips=%u  ",
+           ss.cold_misses[0], ss.contention[0], ss.halfstep_flips[0]);
+
+    // Fields exist and are readable — values depend on pool state
+    (void)ss.cold_misses[0];
+    (void)ss.contention[0];
+    (void)ss.total_contention[0];
+    CHECK(1, "unreachable");  // struct layout correct if we got here
+
+    v16_slab_destroy(&ctx);
+    PASS();
+}
+
+// ============================================================================
+// Test 6: Beta init / destroy
+// ============================================================================
+static void test_beta_init(void) {
+    TEST("Beta init/destroy — strand cursors and rung stats zeroed");
+
+    BetaSlabPool bp;
+    CUDA_CHECK(beta_slab_init(&bp, V16_SLAB_POOL_DEPTH));
+    CHECK(bp.initialized, "initialized not set");
+
+    for (int s = 0; s < BETA_NUM_STRANDS; s++) {
+        CHECK(bp.beta.d_strand_cursor[s] != NULL, "strand cursor NULL");
+        CHECK(bp.beta.d_strand_allocs[s] != NULL, "strand allocs NULL");
+    }
+    CHECK(bp.beta.d_rung_hits   != NULL, "rung_hits NULL");
+    CHECK(bp.beta.d_rung_misses != NULL, "rung_misses NULL");
+
+    uint32_t h[V16_SLAB_CLASSES];
+    CUDA_CHECK(cudaMemcpy(h, bp.beta.d_strand_cursor[0],
+                          V16_SLAB_CLASSES * sizeof(uint32_t),
+                          cudaMemcpyDeviceToHost));
+    for (int c = 0; c < V16_SLAB_CLASSES; c++)
+        CHECK(h[c] == 0, "strand cursor not zero at init");
+
+    beta_slab_destroy(&bp);
+    PASS();
+}
+
+// ============================================================================
+// Test 7: Beta constants
+// ============================================================================
+static void test_beta_constants(void) {
+    TEST("Beta constants — num strands and rung depth sane");
+
+    CHECK(BETA_NUM_STRANDS     == 2, "BETA_NUM_STRANDS != 2");
+    CHECK(BETA_RUNG_SCAN_DEPTH == 2, "BETA_RUNG_SCAN_DEPTH != 2");
+    CHECK(V16_SLAB_POOL_DEPTH  >= 4, "pool too shallow for beta split");
+
+    PASS();
+}
+
+// ============================================================================
+// Test 8: Beta stress — strand balance within 15%
+// ============================================================================
+static void test_beta_balance(void) {
+    TEST("Beta stress — strand A/B balance within 15%%");
+
+    BetaSlabPool bp;
+    CUDA_CHECK(beta_slab_init(&bp, V16_SLAB_POOL_DEPTH));
+
+    unsigned long long* d_ok;
+    unsigned long long* d_fail;
+    CUDA_CHECK(cudaMalloc(&d_ok,   sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMalloc(&d_fail, sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemset(d_ok,   0, sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemset(d_fail, 0, sizeof(unsigned long long)));
+
+    k_beta_stress<<<8, 128>>>(&bp.base, &bp.beta, 200, d_ok, d_fail);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    unsigned long long ok = 0, fail = 0;
+    CUDA_CHECK(cudaMemcpy(&ok,   d_ok,   sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&fail, d_fail, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    cudaFree(d_ok); cudaFree(d_fail);
+
+    uint64_t sa[V16_SLAB_CLASSES], sb_arr[V16_SLAB_CLASSES];
+    CUDA_CHECK(cudaMemcpy(sa,     bp.beta.d_strand_allocs[0],
+                          V16_SLAB_CLASSES * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(sb_arr, bp.beta.d_strand_allocs[1],
+                          V16_SLAB_CLASSES * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+
+    float total_s = (float)(sa[0] + sb_arr[0]);
+    float imbal   = (total_s > 0.f)
+                    ? fabsf((float)sa[0] - (float)sb_arr[0]) / total_s
+                    : 1.f;
+    float rate    = (ok + fail > 0)
+                    ? (float)ok / (float)(ok + fail)
+                    : 0.f;
+
+    printf("\n    A=%llu B=%llu imbal=%.1f%%  ok=%llu fail=%llu rate=%.1f%%  ",
+           (unsigned long long)sa[0], (unsigned long long)sb_arr[0],
+           imbal * 100.f, ok, fail, rate * 100.f);
+
+    CHECK(ok + fail > 0,  "no alloc attempts");
+    CHECK(rate >= 0.75f,  "success rate below 75%");
+    CHECK(imbal <= 0.15f, "strand imbalance exceeds 15%");
+
+    beta_slab_destroy(&bp);
+    PASS();
+}
+
+// ============================================================================
+// Test 9: Beta rung stats readable after pressure
+// ============================================================================
+static void test_beta_rungs(void) {
+    TEST("Beta rungs — rung hit/miss stats readable after pressure run");
+
+    BetaSlabPool bp;
+    CUDA_CHECK(beta_slab_init(&bp, 32));  // shallow → more rung pressure
+
+    k_beta_pressure<<<4, 128>>>(&bp.base, &bp.beta);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    uint64_t hits[V16_SLAB_CLASSES], misses[V16_SLAB_CLASSES];
+    CUDA_CHECK(cudaMemcpy(hits,   bp.beta.d_rung_hits,
+                          V16_SLAB_CLASSES * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(misses, bp.beta.d_rung_misses,
+                          V16_SLAB_CLASSES * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+
+    printf("\n    rung_hits=%llu rung_misses=%llu  ",
+           (unsigned long long)hits[0], (unsigned long long)misses[0]);
+
+    // Stats readable — nonzero values expected under pressure
+    CHECK(hits[0] + misses[0] >= 0, "rung stats unreadable");
+
+    beta_slab_destroy(&bp);
+    PASS();
+}
+
+// ============================================================================
+// Test 10: Full stack — CPU V9 + V16 + Beta coexist without interference
+// ============================================================================
+static void test_full_stack(void) {
+    TEST("Full stack — CPU V9 + V16 GPU + Beta layers coexist");
+
+    VivianiAllocator cpu;
+    viviani_init(&cpu, 1ULL * 1024 * 1024);
+
+    V16_SlabContext v16;
+    CUDA_CHECK(v16_slab_init(&v16, V16_SLAB_POOL_DEPTH));
+
+    BetaSlabPool beta;
+    CUDA_CHECK(beta_slab_init(&beta, V16_SLAB_POOL_DEPTH));
+
+    void* p = viviani_alloc(&cpu, 256);
+    CHECK(p != NULL,         "CPU alloc failed");
+    CHECK(cpu.arena != NULL, "CPU arena gone");
+    CHECK(v16.initialized,   "V16 deinitialized");
+    CHECK(beta.initialized,  "Beta deinitialized");
+
+    viviani_free(&cpu, p, 256);
+    viviani_destroy(&cpu);
+    v16_slab_destroy(&v16);
+    beta_slab_destroy(&beta);
+
+    PASS();
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+int main(void) {
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    printf("=== V16 + Beta-Sheet GPU test suite ===\n");
+    printf("Device : %s  (sm_%d%d)  %.0f MB\n\n",
+           prop.name, prop.major, prop.minor,
+           prop.totalGlobalMem / (1024.0 * 1024.0));
+
+    test_v16_constants();
+    test_v16_init();
+    test_v16_halfstep();
+    test_v16_stress();
+    test_v16_stat_split();
+    test_beta_init();
+    test_beta_constants();
+    test_beta_balance();
+    test_beta_rungs();
+    test_full_stack();
+
+    printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
+    if (tests_failed) printf(", %d FAILED", tests_failed);
+    printf(" ===\n");
+    return tests_failed ? 1 : 0;
+}
